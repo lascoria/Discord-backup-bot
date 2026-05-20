@@ -1,0 +1,224 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json, os, time
+from pathlib import Path
+
+BACKUP_DIR = Path("C:/Users/Scoria/Desktop/backups")
+BACKUP_DIR.mkdir(exist_ok=True)
+
+intents = discord.Intents.default()
+intents.guilds = True
+
+class BackupBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await self.add_cog(BackupCog(self))
+        await self.tree.sync()
+
+class BackupCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="backup", description="Manage guild backups")
+    @app_commands.describe(action="save | restore | list | delete", name="Backup name")
+    @app_commands.choices(action=[
+        app_commands.Choice(name="save", value="save"),
+        app_commands.Choice(name="restore", value="restore"),
+        app_commands.Choice(name="list", value="list"),
+        app_commands.Choice(name="delete", value="delete"),
+    ])
+    async def backup(self, interaction: discord.Interaction, action: str, name: str = ""):
+        await interaction.response.defer(ephemeral=True)
+
+        if action == "save":
+            await self._save(interaction, name)
+        elif action == "restore":
+            await self._restore(interaction, name)
+        elif action == "list":
+            await self._list(interaction)
+        elif action == "delete":
+            await self._delete(interaction, name)
+
+    async def _save(self, interaction: discord.Interaction, name: str):
+        g = interaction.guild
+        if not name: name = f"backup-{int(time.time())}"
+
+        data = {
+            "name": g.name,
+            "id": g.id,
+            "roles": [],
+            "channels": [],
+            "categories": [],
+        }
+
+        for role in sorted(g.roles, key=lambda r: r.position, reverse=True):
+            if role.managed: continue
+            data["roles"].append({
+                "name": role.name,
+                "color": role.color.value,
+                "hoist": role.hoist,
+                "mentionable": role.mentionable,
+                "permissions": role.permissions.value,
+                "position": role.position,
+            })
+
+        for cat in g.categories:
+            c = {
+                "name": cat.name,
+                "position": cat.position,
+                "id": cat.id,
+                "overwrites": self._serialize_overwrites(cat.overwrites),
+                "channels": [],
+            }
+            for ch in cat.channels:
+                c["channels"].append(self._serialize_channel(ch))
+            data["categories"].append(c)
+
+        for ch in g.channels:
+            if ch.category: continue
+            if isinstance(ch, discord.CategoryChannel): continue
+            data["channels"].append(self._serialize_channel(ch))
+
+        path = BACKUP_DIR / f"{name}.json"
+        path.write_text(json.dumps(data, indent=2))
+        await interaction.followup.send(f"Backup saved as `{name}` ({path.stat().st_size / 1024:.1f} KB)")
+
+    def _serialize_channel(self, ch):
+        base = {
+            "name": ch.name,
+            "type": str(ch.type),
+            "position": ch.position,
+            "overwrites": self._serialize_overwrites(ch.overwrites),
+        }
+        if isinstance(ch, discord.TextChannel):
+            base["topic"] = ch.topic or ""
+            base["slowmode_delay"] = ch.slowmode_delay
+            base["nsfw"] = ch.nsfw
+        elif isinstance(ch, discord.VoiceChannel):
+            base["bitrate"] = ch.bitrate
+            base["user_limit"] = ch.user_limit
+        elif isinstance(ch, discord.ForumChannel):
+            base["topic"] = ch.topic or ""
+        return base
+
+    def _serialize_overwrites(self, overwrites):
+        result = []
+        for target, overwrite in overwrites.items():
+            allow, deny = overwrite.pair()
+            target_type = "role" if isinstance(target, discord.Role) else "member"
+            result.append({
+                "target_id": target.id,
+                "target_type": target_type,
+                "allow": allow.value,
+                "deny": deny.value,
+            })
+        return result
+
+    async def _restore(self, interaction: discord.Interaction, name: str):
+        if not name:
+            await interaction.followup.send("Specify a backup name (`/backup list`)")
+            return
+        path = BACKUP_DIR / f"{name}.json"
+        if not path.exists():
+            await interaction.followup.send(f"Backup `{name}` not found")
+            return
+
+        data = json.loads(path.read_text())
+        g = interaction.guild
+
+        await interaction.followup.send("Starting restore... Deleting existing channels and roles...")
+
+        for ch in list(g.channels):
+            try: await ch.delete()
+            except: pass
+
+        for role in list(g.roles):
+            if role.managed or role.is_default(): continue
+            try: await role.delete()
+            except: pass
+
+        for rd in data["roles"]:
+            try:
+                await g.create_role(
+                    name=rd["name"],
+                    color=discord.Color(rd["color"]),
+                    hoist=rd["hoist"],
+                    mentionable=rd["mentionable"],
+                    permissions=discord.Permissions(rd["permissions"]),
+                )
+            except: pass
+
+        for cd in data["categories"]:
+            overwrites = await self._resolve_overwrites(g, cd["overwrites"])
+            cat = await g.create_category(cd["name"], overwrites=overwrites)
+            for chd in cd["channels"]:
+                await self._create_channel(g, cat, chd)
+
+        for chd in data["channels"]:
+            await self._create_channel(g, None, chd)
+
+        try:
+            await interaction.followup.send(f"Restore complete from `{name}`")
+        except:
+            pass
+
+    async def _create_channel(self, g, category, chd):
+        overwrites = await self._resolve_overwrites(g, chd["overwrites"])
+        kwargs = {"name": chd["name"], "overwrites": overwrites}
+        if category: kwargs["category"] = category
+        try:
+            if chd["type"] == "text":
+                kwargs["topic"] = chd.get("topic", "")
+                kwargs["slowmode_delay"] = chd.get("slowmode_delay", 0)
+                kwargs["nsfw"] = chd.get("nsfw", False)
+                await g.create_text_channel(**kwargs)
+            elif chd["type"] == "voice":
+                kwargs["bitrate"] = chd.get("bitrate", 64000)
+                kwargs["user_limit"] = chd.get("user_limit", 0)
+                await g.create_voice_channel(**kwargs)
+            elif chd["type"] == "forum":
+                kwargs["topic"] = chd.get("topic", "")
+                try: await g.create_forum(**kwargs)
+                except: await g.create_text_channel(**kwargs)
+        except:
+            pass
+
+    async def _resolve_overwrites(self, g, overwrites_data):
+        result = {}
+        for od in overwrites_data:
+            target = None
+            if od["target_type"] == "role":
+                target = g.get_role(od["target_id"])
+            else:
+                target = g.get_member(od["target_id"])
+            if target:
+                result[target] = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(od["allow"]),
+                    discord.Permissions(od["deny"]),
+                )
+        return result
+
+    async def _list(self, interaction: discord.Interaction):
+        files = list(BACKUP_DIR.glob("*.json"))
+        if not files:
+            await interaction.followup.send("No backups found")
+            return
+        msg = "**Backups:**\n" + "\n".join(f"`{f.stem}` ({f.stat().st_size/1024:.0f} KB)" for f in files)
+        await interaction.followup.send(msg)
+
+    async def _delete(self, interaction: discord.Interaction, name: str):
+        if not name:
+            await interaction.followup.send("Specify a backup name to delete")
+            return
+        path = BACKUP_DIR / f"{name}.json"
+        if not path.exists():
+            await interaction.followup.send(f"Backup `{name}` not found")
+            return
+        path.unlink()
+        await interaction.followup.send(f"Deleted backup `{name}`")
+
+bot = BackupBot()
+bot.run("YOUR_TOKEN_HERE")

@@ -4,7 +4,7 @@ from discord import app_commands
 import json, os, time
 from pathlib import Path
 
-BACKUP_DIR = Path("C:/Users/Scoria/Desktop/backups")
+BACKUP_DIR = Path("C:/Users/YOUR_USERNAME/Desktop/backups") "change it to your desktop username and the location you want")
 BACKUP_DIR.mkdir(exist_ok=True)
 
 intents = discord.Intents.default()
